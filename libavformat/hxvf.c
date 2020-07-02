@@ -19,7 +19,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/avassert.h"
 #include "libavutil/intreadwrite.h"
+
 #include "avformat.h"
 #include "internal.h"
 
@@ -34,6 +36,12 @@ enum FrameHeader
     INDEX_FRAME = MKTAG('H', 'X', 'F', 'I')
 };
 
+typedef struct FrameIndexEntry
+{
+    uint32_t offset;
+    uint32_t timestamp;
+} FrameIndexEntry;
+
 
 typedef struct HXVFDemuxContext
 {
@@ -42,7 +50,9 @@ typedef struct HXVFDemuxContext
     int audio_frames_since_last_video_frame;
 
     uint32_t stream_duration;
-    uint32_t index_size;
+
+    uint32_t frame_index_size;
+    FrameIndexEntry *frame_index;
 } HXVFDemuxContext;
 
 
@@ -65,7 +75,7 @@ static int hxvf_probe(const AVProbeData *p)
 }
 
 
-static int parse_frame_index(AVFormatContext *s, HXVFDemuxContext *ctx) {
+static int hxvf_read_frame_index(AVFormatContext *s, HXVFDemuxContext *ctx) {
     if (!s->pb->seekable & AVIO_SEEKABLE_NORMAL)
         return -1;
 
@@ -84,18 +94,42 @@ static int parse_frame_index(AVFormatContext *s, HXVFDemuxContext *ctx) {
     if (size - avio_tell(s->pb) < 12)
         return -1;
 
-    uint32_t index_size = avio_rl32(s->pb);
-    if (index_size % 16 != 0)
+    uint32_t padded_index_size = avio_rl32(s->pb);
+    if (padded_index_size % 8 != 0)
         return -1;
 
     uint32_t stream_duration = avio_rl32(s->pb);  /* in 1/1000s */
     avio_skip(s->pb, 4);  /* unknown */
 
-    if (size - avio_tell(s->pb) < index_size)
+    if (size - avio_tell(s->pb) < padded_index_size)
         return -1;
 
-    ctx->index_size = index_size;
+    FrameIndexEntry *frame_index = NULL;
+
+    int i;
+
+    /* The frame index is 200,000 bytes long but is zero padded at the end */
+    for (i = 0; i * 8 < padded_index_size; i++) {
+        int ret = av_reallocp_array(&frame_index, i + 1, sizeof(FrameIndexEntry));
+        if (ret < 0) {
+            av_log(s, AV_LOG_WARNING, "Failed to allocate memory for frame index\n");
+            return 0;
+        }
+
+        uint32_t offset = avio_rl32(s->pb);
+
+        if (offset == 0) {
+            break;
+        }
+
+        frame_index[i].offset = offset;
+        frame_index[i].timestamp = avio_rl32(s->pb);
+    }
+
     ctx->stream_duration = stream_duration;
+
+    ctx->frame_index = frame_index;
+    ctx->frame_index_size = i;
 
     return 0;
 }
@@ -107,6 +141,9 @@ static int hxvf_read_header(AVFormatContext *s)
     ctx->video_start_timestamp = AV_NOPTS_VALUE;
     ctx->audio_frames_since_last_video_frame = 0;
     ctx->last_video_timestamp = 0;
+
+    ctx->frame_index_size = 0;
+    ctx->frame_index = NULL;
 
     AVStream *video = avformat_new_stream(s, NULL);
     if (!video)
@@ -140,24 +177,8 @@ static int hxvf_read_header(AVFormatContext *s)
     /* Try parsing the frame index (for some reason) */
     int64_t old_pos = avio_tell(s->pb);
 
-    if (parse_frame_index(s, ctx) < 0) {
+    if (hxvf_read_frame_index(s, ctx) < 0) {
         av_log(s, AV_LOG_WARNING, "Input is not seekable or corrupted frame index\n");
-    } else {
-        video->duration = ctx->stream_duration;
-        audio->duration = ctx->stream_duration;
-
-        for (uint64_t i = 0; i < ctx->index_size; i += 16) {
-            uint32_t file_offset = avio_rl32(s->pb);
-
-            if (file_offset == 0)
-                break;
-
-            uint32_t frame_timestamp = avio_rl32(s->pb);
-
-            av_log(s, AV_LOG_DEBUG, "Timestamp %0.4f is at offset %d\n",
-                frame_timestamp / 1000.0,
-                file_offset);
-        }
     }
 
     /* Reset our position in the file after we try to read the frame index */
@@ -291,13 +312,63 @@ static int hxvf_read_packet(AVFormatContext *s, AVPacket *pkt)
 }
 
 
+static int hxvf_read_seek(AVFormatContext *s, int stream_index,
+                         int64_t timestamp, int flags)
+{
+    HXVFDemuxContext *ctx = s->priv_data;
+
+    if (!ctx->frame_index) {
+        av_log(s, AV_LOG_WARNING, "Input is not seekable or corrupted frame index\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    FrameIndexEntry *low = ctx->frame_index;
+    FrameIndexEntry *midpoint;
+    FrameIndexEntry *high = ctx->frame_index + ctx->frame_index_size;
+
+    if (timestamp > high->timestamp) {
+        return AVERROR_INVALIDDATA;
+    }
+
+    do {
+        midpoint = low + (high - low) / 2;
+
+        if (midpoint->timestamp > timestamp) {
+            high = midpoint;
+        } else if (midpoint->timestamp < timestamp) {
+            low = midpoint;
+        } else {
+            break;
+        }
+    } while (high - low > sizeof(FrameIndexEntry));
+
+    av_assert0(midpoint != NULL);
+
+    avio_seek(s->pb, midpoint->offset, SEEK_SET);
+
+    return 0;
+}
+
+static int hxvf_read_close(AVFormatContext *s)
+{
+    HXVFDemuxContext *ctx = s->priv_data;
+
+    if (ctx->frame_index)
+        av_reallocp_array(&ctx->frame_index, 0, sizeof(FrameIndexEntry));
+
+    return 0;
+}
+
+
 AVInputFormat ff_hxvf_demuxer = {
     .name           = "hxvf",
     .long_name      = NULL_IF_CONFIG_SMALL("Hichip security camera video"),
-    .flags          = AVFMT_GENERIC_INDEX | AVFMT_VARIABLE_FPS,
+    .flags          = AVFMT_VARIABLE_FPS | AVFMT_NO_BYTE_SEEK | AVFMT_SEEK_TO_PTS,
     .priv_data_size = sizeof(HXVFDemuxContext),
     .read_probe     = hxvf_probe,
     .read_header    = hxvf_read_header,
     .read_packet    = hxvf_read_packet,
+    .read_seek      = hxvf_read_seek,
+    .read_close     = hxvf_read_close,
     .extensions     = "264",
 };
