@@ -190,6 +190,7 @@ extern AVOutputFormat ff_hevc_muxer;
 extern AVInputFormat  ff_hls_demuxer;
 extern AVOutputFormat ff_hls_muxer;
 extern AVInputFormat  ff_hnm_demuxer;
+extern AVInputFormat  ff_hxvf_demuxer;
 extern AVInputFormat  ff_ico_demuxer;
 extern AVOutputFormat ff_ico_muxer;
 extern AVInputFormat  ff_idcin_demuxer;
